@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright (c) 2016-2026 by University of Kassel and Fraunhofer Institute for Energy Economics
+# Copyright (c) 2016-2023 by University of Kassel and Fraunhofer Institute for Energy Economics
 # and Energy System Technology (IEE), Kassel. All rights reserved.
 
 import numpy as np
@@ -14,9 +14,11 @@ from pandapower.estimation.idx_bus import ZERO_INJ_FLAG, P, P_STD, Q, Q_STD
 from pandapower.estimation.ppc_conversion import ExtendedPPCI
 from pandapower.pypower.idx_bus import bus_cols
 
-import logging
+try:
+    import pandaplan.core.pplog as logging
+except ImportError:
+    import logging
 std_logger = logging.getLogger(__name__)
-std_logger.setLevel(logging.DEBUG)
 
 __all__ = ["WLSAlgorithm", "WLSZeroInjectionConstraintsAlgorithm", "IRWLSAlgorithm"]
 
@@ -36,24 +38,22 @@ class BaseAlgorithm:
     def check_observability(self, eppci: ExtendedPPCI, z):
         # Check if observability criterion is fulfilled and the state estimation is possible
         num_slacks = sum(~eppci.non_slack_bus_mask)
-        measurements_available = 2 * eppci["bus"].shape[0] - num_slacks
-        if len(z) < measurements_available:
+        if len(z) < 2 * eppci["bus"].shape[0] - num_slacks:
             self.logger.error("System is not observable (cancelling)")
-            self.logger.error(f"Measurements available: {len(z)}. Measurements required: {measurements_available}")
-            raise UserWarning(f"Measurements available: {len(z)}. Measurements required: {measurements_available}")
+            self.logger.error("Measurements available: %d. Measurements required: %d" %
+                              (len(z), 2 * eppci["bus"].shape[0] - 1))
+            raise UserWarning("Measurements available: %d. Measurements required: %d" %
+                              (len(z), 2 * eppci["bus"].shape[0] - 1))
 
     def check_result(self, current_error, cur_it):
         # print output for results
         if current_error <= self.tolerance:
             self.successful = True
-            self.logger.debug(
-                f"State Estimation successful ({cur_it:d} iterations)"
-            )
+            self.logger.debug("State Estimation successful ({:d} iterations)".format(cur_it))
         else:
             self.successful = False
-            self.logger.debug(
-                f"State Estimation not successful ({cur_it:d}/{self.max_iterations:d} iterations)"
-            )
+            self.logger.debug("State Estimation not successful ({:d}/{:d} iterations)".format(cur_it,
+                                                                                              self.max_iterations))
 
     def initialize(self, eppci: ExtendedPPCI):
         # Check observability
@@ -78,8 +78,28 @@ class WLSAlgorithm(BaseAlgorithm):
         self.hx = None
         self.iterations = None
         self.obj_func = None
+        logging.basicConfig(level=logging.DEBUG)
 
-    def estimate(self, eppci: ExtendedPPCI, debug_mode=False, **kwargs):
+    def compute_std_dev_estimates(self, sem, G_m, V):
+        cov_Vpm = inv(G_m)
+        # difm_dth, difm_dv, ditm_dth, ditm_dv, _, _, _, _ = sem._dimiabr_dV(V)
+        difm_dth, difm_dv, _, _, _, _, _, _ = sem._dimiabr_dV(V)
+        ifm_jac = hstack((difm_dth, difm_dv))
+        # itm_jac = hstack((ditm_dth, ditm_dv))
+        ifm_jac = ifm_jac[:, self.eppci.delta_v_bus_mask]
+        # itm_jac = itm_jac[:, self.eppci.delta_v_bus_mask]
+
+        cov_Ifm = ifm_jac@cov_Vpm@np.transpose(ifm_jac)
+        # cov_Itm = itm_jac@cov_Vpm@np.transpose(itm_jac)
+
+        stddev_Vpm = np.sqrt(cov_Vpm.diagonal())
+        stddev_Vm = stddev_Vpm[-len(self.eppci.V):]
+        stddev_Ifm = np.sqrt(cov_Ifm.diagonal())
+        # stddev_Itm = np.sqrt(cov_Itm.diagonal())
+
+        return stddev_Vm, stddev_Ifm
+
+    def estimate(self, eppci: ExtendedPPCI, **kwargs):
         self.initialize(eppci)
         # matrix calculation object
         sem = BaseAlgebra(eppci)
@@ -87,9 +107,7 @@ class WLSAlgorithm(BaseAlgorithm):
         current_error, cur_it = 100., 0
         # invert covariance matrix
         eppci.r_cov[eppci.r_cov<(10**(-5))] = 10**(-5)
-        r_weight = 1 / eppci.r_cov ** 2
-        len_r = np.arange(len(r_weight))
-        r_inv = csr_matrix((r_weight, (len_r, len_r)))
+        r_inv = csr_matrix(np.diagflat(1 / eppci.r_cov ** 2))
         E = eppci.E
         while current_error > self.tolerance and cur_it < self.max_iterations:
             # self.logger.debug("Starting iteration {:d}".format(1 + cur_it))
@@ -111,12 +129,11 @@ class WLSAlgorithm(BaseAlgorithm):
                 # gain matrix G_m
                 # G_m = H^t * R^-1 * H
                 G_m = H.T * (r_inv * H)
-                if debug_mode:
-                    norm_G = norm(G_m, np.inf)
-                    norm_invG = norm(inv(G_m), np.inf)
-                    cond = norm_G*norm_invG
-                    if cond > 10**18:
-                        self.logger.warning("WARNING: Gain matrix is ill-conditioned: {:.2E}".format(cond))
+                # norm_G = norm(G_m, np.inf)
+                # norm_invG = norm(inv(G_m), np.inf)
+                # cond = norm_G*norm_invG
+                # if cond > 10**18:
+                #     self.logger.warning("WARNING: Gain matrix is ill-conditioned: {:.2E}".format(cond))
 
                 # state vector difference d_E
                 # d_E = G_m^-1 * (H' * R^-1 * r)
@@ -132,10 +149,10 @@ class WLSAlgorithm(BaseAlgorithm):
                 E += d_E.ravel()
                 eppci.update_E(E)
 
-                if debug_mode:
-                    obj_func = (r.T*r_inv*r)[0,0]
-                    self.logger.debug("Current delta_x: {:.7f}".format(current_error))
-                    self.logger.debug("Current objective function value: {:.1f}".format(obj_func))
+                # log data 
+                # obj_func = (r.T*r_inv*r)[0,0]
+                # self.logger.debug("Current delta_x: {:.7f}".format(current_error))
+                # self.logger.debug("Current objective function value: {:.1f}".format(obj_func))
 
                 # Restore full weighting matrix with current measurements
                 if cur_it == 0 and eppci.any_i_meas:
@@ -149,12 +166,14 @@ class WLSAlgorithm(BaseAlgorithm):
                                   "Check and change the measurement set.")
                 return False
 
-        # check if the estimation is successful
+        # check if the estimation is successfull
         self.check_result(current_error, cur_it)
         self.iterations = cur_it
-        if debug_mode:
-            self.obj_func = obj_func
+        # self.obj_func = obj_func
         if self.successful:
+            # compute voltage and current magnitude uncertainties
+            V = self.eppci.E2V(E)
+            eppci.std_Vm, eppci.std_Ifm = self.compute_std_dev_estimates(sem, G_m, V)
             # store variables required for chi^2 and r_N_max test:
             self.R_inv = r_inv.toarray()
             self.Gm = G_m.toarray()
@@ -184,9 +203,7 @@ class WLSZeroInjectionConstraintsAlgorithm(BaseAlgorithm):
         sem = BaseAlgebraZeroInjConstraints(eppci)
 
         current_error, cur_it = 100., 0
-        r_weight = 1 / eppci.r_cov ** 2
-        len_r = np.arange(len(r_weight))
-        r_inv = csr_matrix((r_weight, (len_r, len_r)))
+        r_inv = csr_matrix((np.diagflat(1 / eppci.r_cov) ** 2))
         E = eppci.E
         # update the E matrix
         E_ext = np.r_[eppci.E, new_states]
@@ -292,8 +309,9 @@ class AFWLSAlgorithm(BaseAlgorithm):
         self.hx = None
         self.iterations = None
         self.obj_func = None
+        logging.basicConfig(level=logging.DEBUG)
 
-    def estimate(self, eppci: ExtendedPPCI, debug_mode=False, **kwargs):
+    def estimate(self, eppci: ExtendedPPCI, **kwargs):
         self.initialize(eppci)
         # matrix calculation object
         sem = BaseAlgebra(eppci)
@@ -301,9 +319,7 @@ class AFWLSAlgorithm(BaseAlgorithm):
         current_error, cur_it = 100., 0
         # invert covariance matrix
         eppci.r_cov[eppci.r_cov<(10**(-5))] = 10**(-5)
-        r_weight = 1 / eppci.r_cov ** 2
-        len_r = np.arange(len(r_weight))
-        r_inv = csr_matrix((r_weight, (len_r, len_r)))
+        r_inv = csr_matrix(np.diagflat(1 / eppci.r_cov ** 2))
         E = eppci.E
         num_clusters = len(self.eppci["clusters"])
         while current_error > self.tolerance and cur_it < self.max_iterations:
@@ -323,12 +339,11 @@ class AFWLSAlgorithm(BaseAlgorithm):
 
                 # gain matrix G_m
                 G_m = H.T * (r_inv * H)
-                if debug_mode: 
-                    norm_G = norm(G_m, np.inf)
-                    norm_invG = norm(inv(G_m), np.inf)
-                    cond = norm_G*norm_invG
-                    if cond > 10**18:
-                        self.logger.warning("WARNING: Gain matrix is ill-conditioned: {:.2E}".format(cond))
+                norm_G = norm(G_m, np.inf)
+                norm_invG = norm(inv(G_m), np.inf)
+                cond = norm_G*norm_invG
+                if cond > 10**18:
+                    self.logger.warning("WARNING: Gain matrix is ill-conditioned: {:.2E}".format(cond))
 
                 # state vector difference d_E
                 d_E = spsolve(G_m, H.T * (r_inv * r))
@@ -338,10 +353,9 @@ class AFWLSAlgorithm(BaseAlgorithm):
 
                 # log data 
                 current_error = np.max(np.abs(d_E))
-                if debug_mode:
-                    obj_func = (r.T*r_inv*r)[0,0]
-                    self.logger.debug("Current delta_x: {:.7f}".format(current_error))
-                    self.logger.debug("Current objective function value: {:.1f}".format(obj_func))
+                # obj_func = (r.T*r_inv*r)[0,0]
+                # self.logger.debug("Current delta_x: {:.7f}".format(current_error))
+                # self.logger.debug("Current objective function value: {:.1f}".format(obj_func))
 
                 # Restore full weighting matrix
                 if cur_it == 0 and eppci.any_i_meas:
@@ -358,9 +372,13 @@ class AFWLSAlgorithm(BaseAlgorithm):
         # check if the estimation is successfull
         self.check_result(current_error, cur_it)
         self.iterations = cur_it
-        if debug_mode:
-            self.obj_func = obj_func
+        # self.obj_func = obj_func
         if self.successful:
+            # store variables required for chi^2 and r_N_max test:
+            self.R_inv = r_inv.toarray()
+            self.Gm = G_m.toarray()
+            self.r = r.toarray()
+            self.H = H.toarray()
             # split voltage and allocation factor variables
             E1 = E[:-num_clusters]
             E2 = E[-num_clusters:]
